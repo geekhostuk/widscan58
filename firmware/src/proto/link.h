@@ -1,4 +1,5 @@
-/* Non-blocking output queue to USB Serial/JTAG. GPL-3.0-or-later. */
+/* Non-blocking output queue to USB Serial/JTAG, or a UART when built with
+ * LINK_UART (env esp32c5_uart). GPL-3.0-or-later. */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>

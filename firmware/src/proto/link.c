@@ -2,7 +2,11 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#if LINK_UART
+#include "driver/uart.h"
+#else
 #include "driver/usb_serial_jtag.h"
+#endif
 #include "esp_attr.h"
 #include "esp_rom_crc.h"
 #include "freertos/FreeRTOS.h"
@@ -21,6 +25,65 @@
 #define LINK_QUEUE_BYTES (72 * 1024)
 #define LINK_USB_TX_BYTES 16384
 #endif
+#if LINK_UART
+/* LINK_UART: the link runs over a hardware UART instead of USB Serial/JTAG,
+ * for a host that can't be a USB host (a gate controller). Pins and baud come
+ * from the build (platformio.ini, env esp32c5_uart). */
+#ifndef LINK_UART_NUM
+#define LINK_UART_NUM UART_NUM_1
+#endif
+#ifndef LINK_UART_BAUD
+#define LINK_UART_BAUD 2000000
+#endif
+#define LINK_RX_BYTES 1024
+
+static int hw_write(const uint8_t *p, size_t n, TickType_t wait) {
+    (void)wait; /* blocks until the bytes are in the driver's TX buffer */
+    return uart_write_bytes(LINK_UART_NUM, p, n);
+}
+
+static void hw_init(void) {
+    uart_config_t cfg = {
+        .baud_rate = LINK_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(LINK_UART_NUM, LINK_RX_BYTES, LINK_USB_TX_BYTES, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(LINK_UART_NUM, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(LINK_UART_NUM, LINK_UART_TX, LINK_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+
+/* As usb_serial_jtag_read_bytes: wait for the first byte only, then take
+ * what has arrived (uart_read_bytes alone waits for all of capacity). */
+static int hw_read(uint8_t *buf, size_t capacity, TickType_t wait) {
+    if (!capacity) return 0;
+    int n = uart_read_bytes(LINK_UART_NUM, buf, 1, wait);
+    if (n <= 0) return n;
+    size_t more = 0;
+    uart_get_buffered_data_len(LINK_UART_NUM, &more);
+    if (more > capacity - 1) more = capacity - 1;
+    if (more) {
+        int m = uart_read_bytes(LINK_UART_NUM, buf + 1, more, 0);
+        if (m > 0) n += m;
+    }
+    return n;
+}
+#else
+static int hw_write(const uint8_t *p, size_t n, TickType_t wait) { return usb_serial_jtag_write_bytes(p, n, wait); }
+
+static void hw_init(void) {
+    usb_serial_jtag_driver_config_t cfg = {.tx_buffer_size = LINK_USB_TX_BYTES, .rx_buffer_size = 1024};
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
+}
+
+static int hw_read(uint8_t *buf, size_t capacity, TickType_t wait) {
+    return usb_serial_jtag_read_bytes(buf, capacity, wait);
+}
+#endif
+
 static RingbufHandle_t queue;
 static volatile uint32_t drops;
 static volatile bool streaming; /* frames allowed (link_set_streaming); off at boot */
@@ -36,7 +99,7 @@ static void link_task(void *arg) {
         while (done < size) {
             /* The driver cannot accept a write larger than its TX buffer. */
             size_t chunk = size - done > 4096 ? 4096 : size - done;
-            int n = usb_serial_jtag_write_bytes(item + done, chunk, pdMS_TO_TICKS(50));
+            int n = hw_write(item + done, chunk, pdMS_TO_TICKS(50));
             if (n <= 0) break;
             done += (size_t)n;
         }
@@ -46,8 +109,7 @@ static void link_task(void *arg) {
 }
 
 void link_init(void) {
-    usb_serial_jtag_driver_config_t cfg = {.tx_buffer_size = LINK_USB_TX_BYTES, .rx_buffer_size = 1024};
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
+    hw_init();
     queue = xRingbufferCreate(LINK_QUEUE_BYTES, RINGBUF_TYPE_NOSPLIT);
     xTaskCreatePinnedToCore(link_task, "link", 4096, NULL, 5, NULL, portNUM_PROCESSORS - 1);
 }
@@ -122,5 +184,5 @@ bool link_printf(const char *fmt, ...) {
 }
 
 int link_read(uint8_t *buf, size_t capacity, uint32_t timeout_ms) {
-    return usb_serial_jtag_read_bytes(buf, capacity, timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms));
+    return hw_read(buf, capacity, timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms));
 }
